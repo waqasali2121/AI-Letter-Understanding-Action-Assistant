@@ -6,7 +6,6 @@ import streamlit as st
 from groq import Groq
 from google.cloud import vision
 from google.oauth2 import service_account
-from google.auth.transport.requests import Request
 
 import fitz  # PyMuPDF
 from docx import Document
@@ -39,12 +38,16 @@ REVIEW_MODEL = "openai/gpt-oss-120b"
 GROQ_API_KEY = None
 
 try:
-    GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
+    GROQ_API_KEY = st.secrets.get(
+        "GROQ_API_KEY"
+    )
 except Exception:
     GROQ_API_KEY = None
 
 if not GROQ_API_KEY:
-    GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+    GROQ_API_KEY = os.environ.get(
+        "GROQ_API_KEY"
+    )
 
 if not GROQ_API_KEY:
     st.error(
@@ -59,35 +62,28 @@ groq_client = Groq(
 
 
 # ============================================================
-# GOOGLE CLOUD VISION
+# GOOGLE CLOUD VISION CONFIGURATION
 # ============================================================
 
 def get_google_config():
-    """
-    Read Google service-account configuration.
-
-    Preferred Streamlit structure:
-
-    [google]
-    type = "service_account"
-    project_id = "..."
-    ...
-
-    Also supports flat secrets as a fallback.
-    """
 
     try:
+
         # Preferred structure:
+        #
         # [google]
+        # type = "service_account"
+        # ...
+
         if "google" in st.secrets:
 
-            google_config = dict(
+            return dict(
                 st.secrets["google"]
             )
 
-            return google_config
+        # Optional fallback:
+        # support flat secrets too.
 
-        # Fallback for flat secrets
         required_fields = [
             "type",
             "project_id",
@@ -130,8 +126,8 @@ def create_vision_client():
 
             raise ValueError(
                 "Google credentials were not found. "
-                "Add a [google] section to "
-                ".streamlit/secrets.toml."
+                "Make sure your Streamlit secrets contain "
+                "a [google] section."
             )
 
         required_fields = [
@@ -147,14 +143,20 @@ def create_vision_client():
             "client_x509_cert_url",
         ]
 
-        missing = [
-            field
-            for field in required_fields
-            if field not in google_config
-            or not str(
-                google_config[field]
-            ).strip()
-        ]
+        missing = []
+
+        for field in required_fields:
+
+            if (
+                field not in google_config
+                or not str(
+                    google_config[field]
+                ).strip()
+            ):
+
+                missing.append(
+                    field
+                )
 
         if missing:
 
@@ -164,12 +166,15 @@ def create_vision_client():
             )
 
         # ----------------------------------------------------
-        # Fix escaped private-key newlines.
+        # PRIVATE KEY
         # ----------------------------------------------------
 
         private_key = str(
             google_config["private_key"]
         )
+
+        # Handle keys stored with literal \n
+        # instead of actual line breaks.
 
         private_key = private_key.replace(
             "\\n",
@@ -177,25 +182,33 @@ def create_vision_client():
         )
 
         # ----------------------------------------------------
-        # Build service-account credentials.
+        # SERVICE ACCOUNT INFO
         # ----------------------------------------------------
 
         credentials_info = {
 
             "type":
-                google_config["type"],
+                str(
+                    google_config["type"]
+                ),
 
             "project_id":
-                google_config["project_id"],
+                str(
+                    google_config["project_id"]
+                ),
 
             "private_key_id":
-                google_config["private_key_id"],
+                str(
+                    google_config["private_key_id"]
+                ),
 
             "private_key":
                 private_key,
 
             "client_email":
-                google_config["client_email"],
+                str(
+                    google_config["client_email"]
+                ),
 
             "client_id":
                 str(
@@ -203,27 +216,41 @@ def create_vision_client():
                 ),
 
             "auth_uri":
-                google_config["auth_uri"],
+                str(
+                    google_config["auth_uri"]
+                ),
 
             "token_uri":
-                google_config["token_uri"],
+                str(
+                    google_config["token_uri"]
+                ),
 
             "auth_provider_x509_cert_url":
-                google_config[
-                    "auth_provider_x509_cert_url"
-                ],
+                str(
+                    google_config[
+                        "auth_provider_x509_cert_url"
+                    ]
+                ),
 
             "client_x509_cert_url":
-                google_config[
-                    "client_x509_cert_url"
-                ],
+                str(
+                    google_config[
+                        "client_x509_cert_url"
+                    ]
+                ),
 
             "universe_domain":
-                google_config.get(
-                    "universe_domain",
-                    "googleapis.com"
+                str(
+                    google_config.get(
+                        "universe_domain",
+                        "googleapis.com"
+                    )
                 ),
         }
+
+        # ----------------------------------------------------
+        # CREATE GOOGLE CREDENTIALS
+        # ----------------------------------------------------
 
         credentials = (
             service_account
@@ -234,19 +261,18 @@ def create_vision_client():
         )
 
         # ----------------------------------------------------
-        # IMPORTANT:
-        # Validate that the service account can actually
-        # authenticate with Google.
+        # CREATE VISION CLIENT
         #
-        # This does NOT perform OCR.
-        # ----------------------------------------------------
-
-        credentials.refresh(
-            Request()
-        )
-
-        # ----------------------------------------------------
-        # Create Vision client.
+        # IMPORTANT:
+        # Do NOT manually call:
+        #
+        # credentials.refresh(Request())
+        #
+        # That was causing:
+        # invalid_scope
+        #
+        # The Google Vision client handles authentication
+        # when an API request is made.
         # ----------------------------------------------------
 
         client = vision.ImageAnnotatorClient(
@@ -338,11 +364,14 @@ STATION_ALIASES = {
     "battagram": "Battagram",
 
     "khwajawas": "Khwajawas",
+
     "khwaja woos": "Khwajawas",
+
     "khwaja woos police station":
         "Khwajawas",
 
     "sro kalay": "Sro Kalay",
+
     "sro kalai": "Sro Kalay",
 }
 
@@ -579,32 +608,40 @@ def vision_ocr_image(image_bytes):
             error
         )
 
-    image = vision.Image(
-        content=image_bytes
-    )
+    try:
 
-    response = (
-        vision_client
-        .document_text_detection(
-            image=image
+        image = vision.Image(
+            content=image_bytes
         )
-    )
 
-    if response.error.message:
+        response = (
+            vision_client
+            .document_text_detection(
+                image=image
+            )
+        )
+
+        if response.error.message:
+
+            raise RuntimeError(
+                response.error.message
+            )
+
+        if not response.full_text_annotation:
+
+            return ""
+
+        return (
+            response
+            .full_text_annotation
+            .text
+        )
+
+    except Exception as e:
 
         raise RuntimeError(
-            response.error.message
+            f"Google Vision OCR request failed: {e}"
         )
-
-    if not response.full_text_annotation:
-
-        return ""
-
-    return (
-        response
-        .full_text_annotation
-        .text
-    )
 
 
 # ============================================================
@@ -641,12 +678,13 @@ def extract_text_from_pdf(
 
                 continue
 
-            # Scanned page
+            # Scanned PDF page
+
             if vision_client is None:
 
                 raise RuntimeError(
                     "This PDF contains scanned pages, "
-                    "but Google Vision OCR is not connected.\n\n"
+                    "but Google Vision OCR is not configured.\n\n"
                     + st.session_state.get(
                         "vision_error",
                         ""
@@ -1249,11 +1287,11 @@ st.sidebar.title(
 if vision_client is not None:
 
     st.sidebar.success(
-        "Google Vision OCR: Connected"
+        "Google Vision OCR: Configured"
     )
 
     st.sidebar.caption(
-        "Google service-account authentication verified."
+        "Google service-account credentials loaded."
     )
 
 else:
@@ -1403,7 +1441,7 @@ if uploaded_file:
             uploaded_file.name.lower()
         )
 
-        needs_ocr = filename.endswith(
+        is_image = filename.endswith(
             (
                 ".png",
                 ".jpg",
@@ -1415,13 +1453,23 @@ if uploaded_file:
         )
 
         if (
-            needs_ocr
+            is_image
             and vision_client is None
         ):
 
             st.error(
-                "Google Cloud Vision OCR is not connected."
+                "Google Cloud Vision OCR is not configured."
             )
+
+            if st.session_state.get(
+                "vision_error"
+            ):
+
+                st.code(
+                    st.session_state[
+                        "vision_error"
+                    ]
+                )
 
         else:
 
@@ -1470,136 +1518,100 @@ if uploaded_file:
 
     if analyze_button:
 
-        filename = (
-            uploaded_file.name.lower()
-        )
+        try:
 
-        needs_ocr = filename.endswith(
-            (
-                ".png",
-                ".jpg",
-                ".jpeg",
-                ".tif",
-                ".tiff",
-                ".bmp",
-            )
-        )
-
-        if (
-            needs_ocr
-            and vision_client is None
-        ):
-
-            st.error(
-                "Google Cloud Vision OCR is not connected."
-            )
-
-            if st.session_state.get(
-                "vision_error"
+            with st.spinner(
+                "Extracting document text..."
             ):
 
-                st.code(
-                    st.session_state[
-                        "vision_error"
-                    ]
+                letter_text = extract_text(
+                    uploaded_file
                 )
 
-        else:
+            if not letter_text.strip():
 
-            try:
+                st.error(
+                    "No readable text was found."
+                )
 
-                with st.spinner(
-                    "Extracting document text..."
-                ):
+                st.stop()
 
-                    letter_text = extract_text(
-                        uploaded_file
-                    )
-
-                if not letter_text.strip():
-
-                    st.error(
-                        "No readable text was found."
-                    )
-
-                    st.stop()
-
-                st.session_state[
-                    "letter_text"
-                ] = letter_text
+            st.session_state[
+                "letter_text"
+            ] = letter_text
 
 
-                # Security check
+            # Security check
 
-                with st.spinner(
-                    "Checking document security..."
-                ):
+            with st.spinner(
+                "Checking document security..."
+            ):
 
-                    safe = prompt_guard(
-                        letter_text
-                    )
-
-                if not safe:
-
-                    st.error(
-                        "Document blocked by the "
-                        "security filter."
-                    )
-
-                    st.stop()
-
-
-                # Rule engine
-
-                routing = rule_based_routing(
+                safe = prompt_guard(
                     letter_text
                 )
 
-                st.session_state[
-                    "routing"
-                ] = routing
-
-
-                # Main AI
-
-                with st.spinner(
-                    "AI is understanding the letter..."
-                ):
-
-                    analysis = analyze_letter(
-                        letter_text,
-                        routing
-                    )
-
-                st.session_state[
-                    "analysis"
-                ] = analysis
-
-
-                # Review AI
-
-                with st.spinner(
-                    "Performing verification..."
-                ):
-
-                    review = review_analysis(
-                        letter_text,
-                        analysis
-                    )
-
-                st.session_state[
-                    "review"
-                ] = review
-
-                st.success(
-                    "✅ Letter successfully analyzed."
-                )
-
-            except Exception as e:
+            if not safe:
 
                 st.error(
-                    f"Unable to process document: {e}"
+                    "Document blocked by the "
+                    "security filter."
                 )
+
+                st.stop()
+
+
+            # Rule engine
+
+            routing = rule_based_routing(
+                letter_text
+            )
+
+            st.session_state[
+                "routing"
+            ] = routing
+
+
+            # Main AI
+
+            with st.spinner(
+                "AI is understanding the letter..."
+            ):
+
+                analysis = analyze_letter(
+                    letter_text,
+                    routing
+                )
+
+            st.session_state[
+                "analysis"
+            ] = analysis
+
+
+            # Review AI
+
+            with st.spinner(
+                "Performing verification..."
+            ):
+
+                review = review_analysis(
+                    letter_text,
+                    analysis
+                )
+
+            st.session_state[
+                "review"
+            ] = review
+
+            st.success(
+                "✅ Letter successfully analyzed."
+            )
+
+        except Exception as e:
+
+            st.error(
+                f"Unable to process document: {e}"
+            )
 
 
 # ============================================================
