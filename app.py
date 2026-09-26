@@ -6,6 +6,7 @@ import streamlit as st
 from groq import Groq
 from google.cloud import vision
 from google.oauth2 import service_account
+from google.auth.transport.requests import Request
 
 import fitz  # PyMuPDF
 from docx import Document
@@ -35,16 +36,15 @@ REVIEW_MODEL = "openai/gpt-oss-120b"
 # GROQ
 # ============================================================
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_API_KEY = None
 
-# Streamlit Cloud fallback
+try:
+    GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
+except Exception:
+    GROQ_API_KEY = None
+
 if not GROQ_API_KEY:
-    try:
-        GROQ_API_KEY = st.secrets.get(
-            "GROQ_API_KEY"
-        )
-    except Exception:
-        GROQ_API_KEY = None
+    GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
     st.error(
@@ -62,15 +62,77 @@ groq_client = Groq(
 # GOOGLE CLOUD VISION
 # ============================================================
 
+def get_google_config():
+    """
+    Read Google service-account configuration.
+
+    Preferred Streamlit structure:
+
+    [google]
+    type = "service_account"
+    project_id = "..."
+    ...
+
+    Also supports flat secrets as a fallback.
+    """
+
+    try:
+        # Preferred structure:
+        # [google]
+        if "google" in st.secrets:
+
+            google_config = dict(
+                st.secrets["google"]
+            )
+
+            return google_config
+
+        # Fallback for flat secrets
+        required_fields = [
+            "type",
+            "project_id",
+            "private_key_id",
+            "private_key",
+            "client_email",
+            "client_id",
+            "auth_uri",
+            "token_uri",
+            "auth_provider_x509_cert_url",
+            "client_x509_cert_url",
+        ]
+
+        if all(
+            field in st.secrets
+            for field in required_fields
+        ):
+
+            return {
+                field: st.secrets[field]
+                for field in required_fields
+            }
+
+        return None
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"Unable to read Streamlit secrets: {e}"
+        )
+
+
 def create_vision_client():
 
     try:
 
-        if "google" not in st.secrets:
+        google_config = get_google_config()
 
-            return None
+        if not google_config:
 
-        google_config = st.secrets["google"]
+            raise ValueError(
+                "Google credentials were not found. "
+                "Add a [google] section to "
+                ".streamlit/secrets.toml."
+            )
 
         required_fields = [
             "type",
@@ -85,13 +147,14 @@ def create_vision_client():
             "client_x509_cert_url",
         ]
 
-        missing = []
-
-        for field in required_fields:
-
-            if field not in google_config:
-
-                missing.append(field)
+        missing = [
+            field
+            for field in required_fields
+            if field not in google_config
+            or not str(
+                google_config[field]
+            ).strip()
+        ]
 
         if missing:
 
@@ -99,6 +162,23 @@ def create_vision_client():
                 "Missing Google credential fields: "
                 + ", ".join(missing)
             )
+
+        # ----------------------------------------------------
+        # Fix escaped private-key newlines.
+        # ----------------------------------------------------
+
+        private_key = str(
+            google_config["private_key"]
+        )
+
+        private_key = private_key.replace(
+            "\\n",
+            "\n"
+        )
+
+        # ----------------------------------------------------
+        # Build service-account credentials.
+        # ----------------------------------------------------
 
         credentials_info = {
 
@@ -112,13 +192,15 @@ def create_vision_client():
                 google_config["private_key_id"],
 
             "private_key":
-                google_config["private_key"],
+                private_key,
 
             "client_email":
                 google_config["client_email"],
 
             "client_id":
-                google_config["client_id"],
+                str(
+                    google_config["client_id"]
+                ),
 
             "auth_uri":
                 google_config["auth_uri"],
@@ -151,20 +233,49 @@ def create_vision_client():
             )
         )
 
-        return vision.ImageAnnotatorClient(
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Validate that the service account can actually
+        # authenticate with Google.
+        #
+        # This does NOT perform OCR.
+        # ----------------------------------------------------
+
+        credentials.refresh(
+            Request()
+        )
+
+        # ----------------------------------------------------
+        # Create Vision client.
+        # ----------------------------------------------------
+
+        client = vision.ImageAnnotatorClient(
             credentials=credentials
         )
 
+        return client, None
+
     except Exception as e:
 
-        st.session_state[
-            "vision_error"
-        ] = str(e)
-
-        return None
+        return None, str(e)
 
 
-vision_client = create_vision_client()
+vision_client, vision_error = (
+    create_vision_client()
+)
+
+if vision_error:
+
+    st.session_state[
+        "vision_error"
+    ] = vision_error
+
+else:
+
+    st.session_state.pop(
+        "vision_error",
+        None
+    )
 
 
 # ============================================================
@@ -511,49 +622,63 @@ def extract_text_from_pdf(
 
     pages = []
 
-    for page_number, page in enumerate(
-        pdf
-    ):
+    try:
 
-        # First try normal PDF text
-        text = page.get_text(
-            "text"
-        ).strip()
+        for page_number, page in enumerate(
+            pdf
+        ):
 
-        if text:
+            text = page.get_text(
+                "text"
+            ).strip()
 
-            pages.append(
-                f"\n--- Page {page_number + 1} ---\n"
-                f"{text}"
+            if text:
+
+                pages.append(
+                    f"\n--- Page {page_number + 1} ---\n"
+                    f"{text}"
+                )
+
+                continue
+
+            # Scanned page
+            if vision_client is None:
+
+                raise RuntimeError(
+                    "This PDF contains scanned pages, "
+                    "but Google Vision OCR is not connected.\n\n"
+                    + st.session_state.get(
+                        "vision_error",
+                        ""
+                    )
+                )
+
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(
+                    2.0,
+                    2.0
+                ),
+                alpha=False
             )
 
-            continue
-
-        # Scanned page
-        pixmap = page.get_pixmap(
-            matrix=fitz.Matrix(
-                2.0,
-                2.0
-            ),
-            alpha=False
-        )
-
-        image_bytes = pixmap.tobytes(
-            "png"
-        )
-
-        ocr_text = vision_ocr_image(
-            image_bytes
-        )
-
-        if ocr_text.strip():
-
-            pages.append(
-                f"\n--- Page {page_number + 1} OCR ---\n"
-                f"{ocr_text}"
+            image_bytes = pixmap.tobytes(
+                "png"
             )
 
-    pdf.close()
+            ocr_text = vision_ocr_image(
+                image_bytes
+            )
+
+            if ocr_text.strip():
+
+                pages.append(
+                    f"\n--- Page {page_number + 1} OCR ---\n"
+                    f"{ocr_text}"
+                )
+
+    finally:
+
+        pdf.close()
 
     return "\n".join(
         pages
@@ -748,8 +873,6 @@ def prompt_guard(text):
 
     except Exception:
 
-        # If the security model is unavailable,
-        # do not stop ordinary document processing.
         return True
 
     return True
@@ -1123,10 +1246,14 @@ st.sidebar.title(
     "⚙️ System Status"
 )
 
-if vision_client:
+if vision_client is not None:
 
     st.sidebar.success(
         "Google Vision OCR: Connected"
+    )
+
+    st.sidebar.caption(
+        "Google service-account authentication verified."
     )
 
 else:
@@ -1142,7 +1269,8 @@ else:
     if vision_error:
 
         with st.sidebar.expander(
-            "OCR Configuration Error"
+            "OCR Configuration Error",
+            expanded=True
         ):
 
             st.code(
@@ -1271,7 +1399,25 @@ if uploaded_file:
 
     if extract_button:
 
-        if vision_client is None:
+        filename = (
+            uploaded_file.name.lower()
+        )
+
+        needs_ocr = filename.endswith(
+            (
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".tif",
+                ".tiff",
+                ".bmp",
+            )
+        )
+
+        if (
+            needs_ocr
+            and vision_client is None
+        ):
 
             st.error(
                 "Google Cloud Vision OCR is not connected."
@@ -1324,7 +1470,25 @@ if uploaded_file:
 
     if analyze_button:
 
-        if vision_client is None:
+        filename = (
+            uploaded_file.name.lower()
+        )
+
+        needs_ocr = filename.endswith(
+            (
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".tif",
+                ".tiff",
+                ".bmp",
+            )
+        )
+
+        if (
+            needs_ocr
+            and vision_client is None
+        ):
 
             st.error(
                 "Google Cloud Vision OCR is not connected."
@@ -1872,9 +2036,10 @@ if st.button(
                 "letter_text"
             ]
 
-            routing = st.session_state[
-                "routing"
-            ]
+            routing = st.session_state.get(
+                "routing",
+                {}
+            )
 
             prompt = f"""
 
