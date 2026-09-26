@@ -1297,7 +1297,7 @@ if vision_client is not None:
 else:
 
     st.sidebar.error(
-        "Google Vision OCR: Not Connected"
+        Free OCR: Connected
     )
 
     vision_error = st.session_state.get(
