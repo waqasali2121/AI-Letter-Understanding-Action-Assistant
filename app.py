@@ -4,11 +4,12 @@ import json
 
 import streamlit as st
 from groq import Groq
-from google.cloud import vision
-from google.oauth2 import service_account
 
 import fitz  # PyMuPDF
 from docx import Document
+
+from PIL import Image, ImageOps, ImageFilter
+import pytesseract
 
 
 # ============================================================
@@ -35,19 +36,13 @@ REVIEW_MODEL = "openai/gpt-oss-120b"
 # GROQ
 # ============================================================
 
-GROQ_API_KEY = None
-
-try:
-    GROQ_API_KEY = st.secrets.get(
-        "GROQ_API_KEY"
-    )
-except Exception:
-    GROQ_API_KEY = None
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
-    GROQ_API_KEY = os.environ.get(
-        "GROQ_API_KEY"
-    )
+    try:
+        GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
+    except Exception:
+        GROQ_API_KEY = None
 
 if not GROQ_API_KEY:
     st.error(
@@ -62,246 +57,108 @@ groq_client = Groq(
 
 
 # ============================================================
-# GOOGLE CLOUD VISION CONFIGURATION
+# FREE LOCAL OCR - TESSERACT
 # ============================================================
 
-def get_google_config():
+def check_tesseract():
+
+    try:
+        version = pytesseract.get_tesseract_version()
+
+        return True, str(version)
+
+    except Exception as e:
+
+        return False, str(e)
+
+
+TESSERACT_AVAILABLE, TESSERACT_VERSION = (
+    check_tesseract()
+)
+
+
+# ============================================================
+# OCR IMAGE PREPROCESSING
+# ============================================================
+
+def preprocess_image(image):
+
+    # Convert to RGB
+    image = image.convert("RGB")
+
+    # Convert to grayscale
+    gray = ImageOps.grayscale(image)
+
+    # Improve contrast
+    gray = ImageOps.autocontrast(gray)
+
+    # Light noise reduction
+    gray = gray.filter(
+        ImageFilter.MedianFilter(size=3)
+    )
+
+    # Upscale small documents
+    width, height = gray.size
+
+    if width < 1800:
+
+        scale = 1800 / width
+
+        gray = gray.resize(
+            (
+                int(width * scale),
+                int(height * scale)
+            ),
+            Image.Resampling.LANCZOS
+        )
+
+    return gray
+
+
+# ============================================================
+# FREE OCR
+# ============================================================
+
+def tesseract_ocr_image(image_bytes):
+
+    if not TESSERACT_AVAILABLE:
+
+        raise RuntimeError(
+            "Tesseract OCR is not installed. "
+            "Make sure packages.txt contains "
+            "tesseract-ocr and tesseract-ocr-urd."
+        )
 
     try:
 
-        # Preferred structure:
-        #
-        # [google]
-        # type = "service_account"
-        # ...
+        image = Image.open(
+            io.BytesIO(image_bytes)
+        )
 
-        if "google" in st.secrets:
+        image = preprocess_image(
+            image
+        )
 
-            return dict(
-                st.secrets["google"]
-            )
+        # English + Urdu OCR
+        text = pytesseract.image_to_string(
+            image,
+            lang="eng+urd",
+            config="--psm 6"
+        )
 
-        # Optional fallback:
-        # support flat secrets too.
+        return text.strip()
 
-        required_fields = [
-            "type",
-            "project_id",
-            "private_key_id",
-            "private_key",
-            "client_email",
-            "client_id",
-            "auth_uri",
-            "token_uri",
-            "auth_provider_x509_cert_url",
-            "client_x509_cert_url",
-        ]
+    except pytesseract.TesseractError as e:
 
-        if all(
-            field in st.secrets
-            for field in required_fields
-        ):
-
-            return {
-                field: st.secrets[field]
-                for field in required_fields
-            }
-
-        return None
+        raise RuntimeError(
+            f"Tesseract OCR failed: {e}"
+        )
 
     except Exception as e:
 
         raise RuntimeError(
-            f"Unable to read Streamlit secrets: {e}"
+            f"OCR processing failed: {e}"
         )
-
-
-def create_vision_client():
-
-    try:
-
-        google_config = get_google_config()
-
-        if not google_config:
-
-            raise ValueError(
-                "Google credentials were not found. "
-                "Make sure your Streamlit secrets contain "
-                "a [google] section."
-            )
-
-        required_fields = [
-            "type",
-            "project_id",
-            "private_key_id",
-            "private_key",
-            "client_email",
-            "client_id",
-            "auth_uri",
-            "token_uri",
-            "auth_provider_x509_cert_url",
-            "client_x509_cert_url",
-        ]
-
-        missing = []
-
-        for field in required_fields:
-
-            if (
-                field not in google_config
-                or not str(
-                    google_config[field]
-                ).strip()
-            ):
-
-                missing.append(
-                    field
-                )
-
-        if missing:
-
-            raise ValueError(
-                "Missing Google credential fields: "
-                + ", ".join(missing)
-            )
-
-        # ----------------------------------------------------
-        # PRIVATE KEY
-        # ----------------------------------------------------
-
-        private_key = str(
-            google_config["private_key"]
-        )
-
-        # Handle keys stored with literal \n
-        # instead of actual line breaks.
-
-        private_key = private_key.replace(
-            "\\n",
-            "\n"
-        )
-
-        # ----------------------------------------------------
-        # SERVICE ACCOUNT INFO
-        # ----------------------------------------------------
-
-        credentials_info = {
-
-            "type":
-                str(
-                    google_config["type"]
-                ),
-
-            "project_id":
-                str(
-                    google_config["project_id"]
-                ),
-
-            "private_key_id":
-                str(
-                    google_config["private_key_id"]
-                ),
-
-            "private_key":
-                private_key,
-
-            "client_email":
-                str(
-                    google_config["client_email"]
-                ),
-
-            "client_id":
-                str(
-                    google_config["client_id"]
-                ),
-
-            "auth_uri":
-                str(
-                    google_config["auth_uri"]
-                ),
-
-            "token_uri":
-                str(
-                    google_config["token_uri"]
-                ),
-
-            "auth_provider_x509_cert_url":
-                str(
-                    google_config[
-                        "auth_provider_x509_cert_url"
-                    ]
-                ),
-
-            "client_x509_cert_url":
-                str(
-                    google_config[
-                        "client_x509_cert_url"
-                    ]
-                ),
-
-            "universe_domain":
-                str(
-                    google_config.get(
-                        "universe_domain",
-                        "googleapis.com"
-                    )
-                ),
-        }
-
-        # ----------------------------------------------------
-        # CREATE GOOGLE CREDENTIALS
-        # ----------------------------------------------------
-
-        credentials = (
-            service_account
-            .Credentials
-            .from_service_account_info(
-                credentials_info
-            )
-        )
-
-        # ----------------------------------------------------
-        # CREATE VISION CLIENT
-        #
-        # IMPORTANT:
-        # Do NOT manually call:
-        #
-        # credentials.refresh(Request())
-        #
-        # That was causing:
-        # invalid_scope
-        #
-        # The Google Vision client handles authentication
-        # when an API request is made.
-        # ----------------------------------------------------
-
-        client = vision.ImageAnnotatorClient(
-            credentials=credentials
-        )
-
-        return client, None
-
-    except Exception as e:
-
-        return None, str(e)
-
-
-vision_client, vision_error = (
-    create_vision_client()
-)
-
-if vision_error:
-
-    st.session_state[
-        "vision_error"
-    ] = vision_error
-
-else:
-
-    st.session_state.pop(
-        "vision_error",
-        None
-    )
 
 
 # ============================================================
@@ -364,14 +221,10 @@ STATION_ALIASES = {
     "battagram": "Battagram",
 
     "khwajawas": "Khwajawas",
-
     "khwaja woos": "Khwajawas",
-
-    "khwaja woos police station":
-        "Khwajawas",
+    "khwaja woos police station": "Khwajawas",
 
     "sro kalay": "Sro Kalay",
-
     "sro kalai": "Sro Kalay",
 }
 
@@ -397,17 +250,13 @@ def get_all_stations():
 
     stations = []
 
-    for station_list in (
-        POLICE_HIERARCHY.values()
-    ):
+    for station_list in POLICE_HIERARCHY.values():
 
         for station in station_list:
 
             if station not in stations:
 
-                stations.append(
-                    station
-                )
+                stations.append(station)
 
     return stations
 
@@ -418,17 +267,13 @@ def find_station_mentions(text):
 
     found = []
 
-    for alias, official_name in (
-        STATION_ALIASES.items()
-    ):
+    for alias, official_name in STATION_ALIASES.items():
 
         if alias in text_lower:
 
             if official_name not in found:
 
-                found.append(
-                    official_name
-                )
+                found.append(official_name)
 
     return found
 
@@ -439,17 +284,13 @@ def find_circle_mentions(text):
 
     found = []
 
-    for alias, official_name in (
-        CIRCLE_ALIASES.items()
-    ):
+    for alias, official_name in CIRCLE_ALIASES.items():
 
         if alias in text_lower:
 
             if official_name not in found:
 
-                found.append(
-                    official_name
-                )
+                found.append(official_name)
 
     return found
 
@@ -467,21 +308,19 @@ def stations_for_circles(circles):
 
             if station not in stations:
 
-                stations.append(
-                    station
-                )
+                stations.append(station)
 
     return stations
 
 
 def rule_based_routing(text):
 
-    station_mentions = (
-        find_station_mentions(text)
+    station_mentions = find_station_mentions(
+        text
     )
 
-    circle_mentions = (
-        find_circle_mentions(text)
+    circle_mentions = find_circle_mentions(
+        text
     )
 
     text_lower = text.lower()
@@ -519,9 +358,7 @@ def rule_based_routing(text):
 
                     if circle not in circles:
 
-                        circles.append(
-                            circle
-                        )
+                        circles.append(circle)
 
         return {
 
@@ -592,65 +429,10 @@ def rule_based_routing(text):
 
 
 # ============================================================
-# GOOGLE VISION OCR
-# ============================================================
-
-def vision_ocr_image(image_bytes):
-
-    if vision_client is None:
-
-        error = st.session_state.get(
-            "vision_error",
-            "Google Vision is not configured."
-        )
-
-        raise RuntimeError(
-            error
-        )
-
-    try:
-
-        image = vision.Image(
-            content=image_bytes
-        )
-
-        response = (
-            vision_client
-            .document_text_detection(
-                image=image
-            )
-        )
-
-        if response.error.message:
-
-            raise RuntimeError(
-                response.error.message
-            )
-
-        if not response.full_text_annotation:
-
-            return ""
-
-        return (
-            response
-            .full_text_annotation
-            .text
-        )
-
-    except Exception as e:
-
-        raise RuntimeError(
-            f"Google Vision OCR request failed: {e}"
-        )
-
-
-# ============================================================
 # PDF EXTRACTION
 # ============================================================
 
-def extract_text_from_pdf(
-    file_bytes
-):
+def extract_text_from_pdf(file_bytes):
 
     pdf = fitz.open(
         stream=file_bytes,
@@ -659,79 +441,66 @@ def extract_text_from_pdf(
 
     pages = []
 
-    try:
+    for page_number, page in enumerate(pdf):
 
-        for page_number, page in enumerate(
-            pdf
-        ):
+        # Try normal PDF text first
+        text = page.get_text(
+            "text"
+        ).strip()
 
-            text = page.get_text(
-                "text"
-            ).strip()
+        if text:
 
-            if text:
-
-                pages.append(
-                    f"\n--- Page {page_number + 1} ---\n"
-                    f"{text}"
-                )
-
-                continue
-
-            # Scanned PDF page
-
-            if vision_client is None:
-
-                raise RuntimeError(
-                    "This PDF contains scanned pages, "
-                    "but Google Vision OCR is not configured.\n\n"
-                    + st.session_state.get(
-                        "vision_error",
-                        ""
-                    )
-                )
-
-            pixmap = page.get_pixmap(
-                matrix=fitz.Matrix(
-                    2.0,
-                    2.0
-                ),
-                alpha=False
+            pages.append(
+                f"\n--- Page {page_number + 1} ---\n"
+                f"{text}"
             )
 
-            image_bytes = pixmap.tobytes(
-                "png"
-            )
+            continue
 
-            ocr_text = vision_ocr_image(
+        # Scanned PDF page
+        pixmap = page.get_pixmap(
+            matrix=fitz.Matrix(
+                2.0,
+                2.0
+            ),
+            alpha=False
+        )
+
+        image_bytes = pixmap.tobytes(
+            "png"
+        )
+
+        try:
+
+            ocr_text = tesseract_ocr_image(
                 image_bytes
             )
 
-            if ocr_text.strip():
+        except Exception as e:
 
-                pages.append(
-                    f"\n--- Page {page_number + 1} OCR ---\n"
-                    f"{ocr_text}"
-                )
+            raise RuntimeError(
+                f"PDF page {page_number + 1} OCR failed: {e}"
+            )
 
-    finally:
+        if ocr_text.strip():
 
-        pdf.close()
+            pages.append(
+                f"\n--- Page {page_number + 1} OCR ---\n"
+                f"{ocr_text}"
+            )
 
-    return "\n".join(
-        pages
-    )
+    pdf.close()
+
+    return "\n".join(pages)
 
 
 # ============================================================
 # IMAGE OCR
 # ============================================================
 
-def extract_text_from_image(
-    file_bytes
-):
+def extract_text_from_image(file_bytes):
 
-    return vision_ocr_image(
+    return tesseract_ocr_image(
         file_bytes
     )
 
@@ -740,9 +509,7 @@ def extract_text_from_image(
 # DOCX
 # ============================================================
 
-def extract_text_from_docx(
-    file_bytes
-):
+def extract_text_from_docx(file_bytes):
 
     document = Document(
         io.BytesIO(file_bytes)
@@ -756,13 +523,9 @@ def extract_text_from_docx(
 
         if text:
 
-            paragraphs.append(
-                text
-            )
+            paragraphs.append(text)
 
-    return "\n".join(
-        paragraphs
-    )
+    return "\n".join(paragraphs)
 
 
 # ============================================================
@@ -772,16 +535,12 @@ def extract_text_from_docx(
 def extract_text(uploaded_file):
 
     filename = (
-        uploaded_file
-        .name
-        .lower()
+        uploaded_file.name.lower()
     )
 
     data = uploaded_file.getvalue()
 
-    if filename.endswith(
-        ".pdf"
-    ):
+    if filename.endswith(".pdf"):
 
         return extract_text_from_pdf(
             data
@@ -802,17 +561,13 @@ def extract_text(uploaded_file):
             data
         )
 
-    if filename.endswith(
-        ".docx"
-    ):
+    if filename.endswith(".docx"):
 
         return extract_text_from_docx(
             data
         )
 
-    if filename.endswith(
-        ".txt"
-    ):
+    if filename.endswith(".txt"):
 
         return data.decode(
             "utf-8",
@@ -927,7 +682,7 @@ for District Police Office Charsadda.
 
 The user is authorized office staff.
 
-The letter may be written in English.
+The letter may be written in English or Urdu.
 Explain important information in simple Urdu.
 
 STRICT RULES:
@@ -975,10 +730,7 @@ Return JSON with these fields:
 # MAIN AI ANALYSIS
 # ============================================================
 
-def analyze_letter(
-    letter_text,
-    routing
-):
+def analyze_letter(letter_text, routing):
 
     routing_text = json.dumps(
         routing,
@@ -1018,19 +770,13 @@ Return JSON only.
             messages=[
 
                 {
-                    "role":
-                        "system",
-
-                    "content":
-                        SYSTEM_PROMPT,
+                    "role": "system",
+                    "content": SYSTEM_PROMPT,
                 },
 
                 {
-                    "role":
-                        "user",
-
-                    "content":
-                        prompt,
+                    "role": "user",
+                    "content": prompt,
                 },
             ],
 
@@ -1051,9 +797,7 @@ Return JSON only.
         .content
     )
 
-    return json.loads(
-        content
-    )
+    return json.loads(content)
 
 
 # ============================================================
@@ -1109,8 +853,7 @@ Return JSON:
             messages=[
 
                 {
-                    "role":
-                        "system",
+                    "role": "system",
 
                     "content":
                         (
@@ -1120,11 +863,8 @@ Return JSON:
                 },
 
                 {
-                    "role":
-                        "user",
-
-                    "content":
-                        prompt,
+                    "role": "user",
+                    "content": prompt,
                 },
             ],
 
@@ -1284,37 +1024,34 @@ st.sidebar.title(
     "⚙️ System Status"
 )
 
-if vision_client is not None:
+if TESSERACT_AVAILABLE:
 
     st.sidebar.success(
-        "Google Vision OCR: Configured"
+        "Free OCR: Connected"
     )
 
     st.sidebar.caption(
-        "Google service-account credentials loaded."
+        "Tesseract OCR"
     )
 
 else:
 
     st.sidebar.error(
-        "Free OCR: Connected"
+        "Free OCR: Not Connected"
     )
 
-    vision_error = st.session_state.get(
-        "vision_error"
+    st.sidebar.warning(
+        "Install Tesseract using packages.txt"
     )
 
-    if vision_error:
 
-        with st.sidebar.expander(
-            "OCR Configuration Error",
-            expanded=True
-        ):
+st.sidebar.write(
+    "**OCR:**"
+)
 
-            st.code(
-                vision_error
-            )
-
+st.sidebar.code(
+    "Tesseract OCR - eng + urd"
+)
 
 st.sidebar.write(
     "**Main AI:**"
@@ -1370,17 +1107,18 @@ st.title(
 )
 
 st.caption(
-    "Official Letter Understanding • OCR • "
-    "Data Extraction • Rule-Based Routing"
+    "Official Letter Understanding • "
+    "Free Open-Source OCR • Data Extraction • "
+    "Rule-Based Routing"
 )
 
 st.info(
     """
 Upload an official letter. The application reads
-normal PDFs, scanned PDFs and images, explains the
-letter in simple Urdu, identifies required data,
-and applies the fixed DPO Charsadda Circle/Station
-routing rules.
+normal PDFs, scanned PDFs and images using free
+local Tesseract OCR, explains the letter in simple
+Urdu, identifies required data, and applies the
+fixed DPO Charsadda Circle/Station routing rules.
 """
 )
 
@@ -1437,79 +1175,43 @@ if uploaded_file:
 
     if extract_button:
 
-        filename = (
-            uploaded_file.name.lower()
-        )
-
-        is_image = filename.endswith(
-            (
-                ".png",
-                ".jpg",
-                ".jpeg",
-                ".tif",
-                ".tiff",
-                ".bmp",
-            )
-        )
-
-        if (
-            is_image
-            and vision_client is None
+        with st.spinner(
+            "Reading document with free OCR..."
         ):
 
-            st.error(
-                "Google Cloud Vision OCR is not configured."
-            )
+            try:
 
-            if st.session_state.get(
-                "vision_error"
-            ):
-
-                st.code(
-                    st.session_state[
-                        "vision_error"
-                    ]
+                text = extract_text(
+                    uploaded_file
                 )
 
-        else:
+                if text.strip():
 
-            with st.spinner(
-                "Reading document..."
-            ):
+                    st.session_state[
+                        "letter_text"
+                    ] = text
 
-                try:
-
-                    text = extract_text(
-                        uploaded_file
+                    st.subheader(
+                        "Extracted Text"
                     )
 
-                    if text.strip():
-
-                        st.session_state[
-                            "letter_text"
-                        ] = text
-
-                        st.subheader(
-                            "Extracted Text"
-                        )
-
-                        st.text_area(
-                            "Document Text",
-                            text,
-                            height=500
-                        )
-
-                    else:
-
-                        st.warning(
-                            "No readable text was found."
-                        )
-
-                except Exception as e:
-
-                    st.error(
-                        f"Document processing error: {e}"
+                    st.text_area(
+                        "Document Text",
+                        text,
+                        height=500
                     )
+
+                else:
+
+                    st.warning(
+                        "No readable text was found."
+                    )
+
+            except Exception as e:
+
+                st.error(
+                    f"Document processing error: {e}"
+                )
 
 
     # ========================================================
@@ -1760,9 +1462,7 @@ if "analysis" in st.session_state:
 
         if routing["circles"]:
 
-            for circle in routing[
-                "circles"
-            ]:
+            for circle in routing["circles"]:
 
                 st.success(
                     circle
@@ -1782,9 +1482,7 @@ if "analysis" in st.session_state:
 
         if routing["stations"]:
 
-            for station in routing[
-                "stations"
-            ]:
+            for station in routing["stations"]:
 
                 st.success(
                     station
@@ -2048,10 +1746,9 @@ if st.button(
                 "letter_text"
             ]
 
-            routing = st.session_state.get(
-                "routing",
-                {}
-            )
+            routing = st.session_state[
+                "routing"
+            ]
 
             prompt = f"""
 
